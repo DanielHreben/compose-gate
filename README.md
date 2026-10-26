@@ -49,7 +49,9 @@ a pty, port forwarding, sftp and scp.
 - **Logging and limits:**
   - every request, accepted or refused, goes to the journal (`journalctl -t compose-gate`);
   - `pull`, `up` and `restart` take a per-project lock;
-  - every command has a timeout.
+  - every command has a timeout;
+  - `logs` stops as soon as the client disconnects, even when the containers
+    are quiet (without a pty, sshd doesn't signal the command).
 
 ## NixOS
 
@@ -96,8 +98,9 @@ It needs `virtualisation.docker.enable`.
 ## Tests
 
 - `python3 -m unittest -v` covers the command table, 60 refused commands,
-  and both halves against a fake `sudo` and `docker` (argv, environment,
-  refusals and the lock). The package build runs these and flake8, so
+  both halves against a fake `sudo` and `docker` (argv, environment,
+  refusals and the lock), and `logs --follow` stopping when the client
+  hangs up. The package build runs these and flake8, so
   every host that builds compose-gate runs them.
 - `tests/module.nix` evaluates a NixOS system using the module and checks
   the generated account, `sshd_config` block, sudo rule and `config.json`.

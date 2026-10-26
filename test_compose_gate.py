@@ -9,8 +9,10 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -244,6 +246,52 @@ class PrivilegedHalf(unittest.TestCase):
             self.assertEqual(self.as_root("restart"), 75)
             self.assertEqual(self.as_root("ps"), 0)  # reads don't wait
         self.assertEqual(self.as_root("restart"), 0)
+
+
+class Hangup(unittest.TestCase):
+    """`logs --follow` stops when the client is gone, even if the
+    containers are quiet: a real root process, a real closed pipe."""
+
+    HARNESS = (
+        "import json, os, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import compose_gate as gate\n"
+        "gate.log = lambda message: None\n"
+        "sys.exit(gate.as_root(json.loads(sys.argv[1]), sys.argv[2:]))\n"
+    ) % os.path.dirname(os.path.abspath(gate.__file__))
+
+    def test_follow_stops_when_the_client_hangs_up(self):
+        tmp = tempfile.mkdtemp()
+        pid_file = os.path.join(tmp, "pid")
+        docker = os.path.join(tmp, "docker")
+        with open(docker, "w") as f:
+            f.write("#!%s\n" % sys.executable + (
+                "import os, sys, time\n"
+                "if sys.argv[-2:] == ['config', '--services']:\n"
+                "    print('minusbot'); sys.exit()\n"
+                "open(%r, 'w').write(str(os.getpid()))\n"
+                "print('following', flush=True)\n"
+                "time.sleep(60)  # a quiet container: no more output\n"
+            ) % pid_file)
+        os.chmod(docker, 0o755)
+        root = subprocess.Popen(
+            [sys.executable, "-c", self.HARNESS,
+             json.dumps(config(docker=docker)), "logs", "--follow"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env={"SUDO_USER": "illia", "PATH": os.environ.get("PATH", "")})
+        self.addCleanup(lambda: root.poll() is None and root.kill())
+        self.assertEqual(root.stdout.readline(), b"following\n")
+        root.stdout.close()  # the client disconnects
+        self.assertEqual(root.wait(timeout=10), 129)
+        with open(pid_file) as f:
+            docker_pid = int(f.read())
+        for _ in range(50):
+            try:
+                os.kill(docker_pid, 0)
+            except ProcessLookupError:
+                return  # docker compose is gone too
+            time.sleep(0.1)
+        self.fail("docker compose still running after the client left")
 
 
 class Main(unittest.TestCase):

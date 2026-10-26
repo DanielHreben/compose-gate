@@ -34,10 +34,12 @@ import json
 import os
 import pwd
 import re
+import select
 import shlex
 import subprocess
 import sys
 import syslog
+import time
 
 CONFIG = "/etc/compose-gate/config.json"
 LOCK_DIR = "/run"
@@ -199,15 +201,48 @@ class Project:
             raise Refused("can't read the project's services")
         return set(out.split())
 
-    def run(self, args, timeout):
-        try:
-            return subprocess.run(
-                self.command + args, env=self.env, stdin=subprocess.DEVNULL,
-                timeout=timeout,
-            ).returncode
-        except subprocess.TimeoutExpired:
-            print("stopped after %d seconds" % timeout, file=sys.stderr)
-            return 124
+    def run(self, args, timeout, stop_on_hangup=False):
+        """Run `docker compose <args>`, stopped after `timeout` seconds.
+
+        With `stop_on_hangup` (read-only commands) it also stops as soon as
+        the client is gone. Without a pty, sshd doesn't signal the command
+        when the connection drops; it only closes the command's output, and
+        a quiet `logs --follow` wouldn't notice until its next write."""
+        if not stop_on_hangup:
+            try:
+                return subprocess.run(
+                    self.command + args, env=self.env,
+                    stdin=subprocess.DEVNULL, timeout=timeout,
+                ).returncode
+            except subprocess.TimeoutExpired:
+                print("stopped after %d seconds" % timeout, file=sys.stderr)
+                return 124
+        proc = subprocess.Popen(
+            self.command + args, env=self.env, stdin=subprocess.DEVNULL)
+        # Event mask 0: only POLLERR/POLLHUP, which a pipe or socket reports
+        # once its reader (sshd) has closed it.
+        watch = select.poll()
+        watch.register(sys.stdout.fileno(), 0)
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                stop(proc)
+                print("stopped after %d seconds" % timeout, file=sys.stderr)
+                return 124
+            if watch.poll(min(left, 1.0) * 1000):
+                stop(proc)
+                return 129  # the client hung up
+        return proc.returncode
+
+
+def stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def as_root(config, argv):
@@ -231,7 +266,7 @@ def as_root(config, argv):
     if command == "logs" and "--follow" in argv:
         timeout = FOLLOW_SECONDS
     if command not in CHANGES:
-        return project.run(argv, timeout)
+        return project.run(argv, timeout, stop_on_hangup=command == "logs")
     lock_path = os.path.join(LOCK_DIR, "compose-gate.%s.lock" % project.name)
     with open(lock_path, "w") as lock:
         try:
