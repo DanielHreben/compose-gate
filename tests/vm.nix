@@ -53,7 +53,7 @@ in
     };
   };
 
-  testScript = ''
+  testScript = { nodes, ... }: ''
     start_all()
     server.wait_for_unit("docker.service")
     server.wait_for_unit("sshd.service")
@@ -101,12 +101,20 @@ in
         server.succeed("journalctl -t compose-gate | grep -q refused")
 
     with subtest("no pty, forwarding, sftp or scp"):
-        client.succeed(f"{ssh} -tt ps 2>&1 | grep -q 'app-web-1'")  # pty refused, command still forced
+        # What the real sshd applies to alice from the client's address. (How
+        # a client reacts to a refused pty differs: `-tt` makes recent
+        # OpenSSH close the session, so test the server, not the client.)
+        effective = server.succeed(
+            "sshd -T -C user=alice,host=client,addr=${nodes.client.networking.primaryIPv6Address}")
+        for line in ["permittty no", "disableforwarding yes", "permituserrc no",
+                     "permittunnel no", "authenticationmethods publickey",
+                     "forcecommand /run/current-system/sw/bin/compose-gate"]:
+            assert line in effective.splitlines(), f"sshd -T lacks {line!r}"
         # A local forward is refused only when something connects through it:
         # open it, then expect no SSH banner from zen's own port 22 through it.
         client.succeed(f"{ssh} -f -N -L 9999:localhost:22")
         client.fail("timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9999; head -c4 <&3' | grep -q SSH-")
-        client.succeed("pkill -f 'L 9999:localhost:22'")
+        client.succeed("pkill -f '[L] 9999:localhost:22'")  # [L]: not pkill's own shell
         client.fail(f"{ssh} -o ExitOnForwardFailure=yes -R 9999:localhost:22 ps")
         client.fail("sftp -i /root/key -o StrictHostKeyChecking=no -b /dev/null alice@server")
         client.fail("scp -O -i /root/key -o StrictHostKeyChecking=no /etc/hosts alice@server:/tmp/pwned")
