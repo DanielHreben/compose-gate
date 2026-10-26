@@ -19,6 +19,7 @@
 
       checks = forAll (pkgs: {
         package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        module = import ./tests/module.nix { inherit nixpkgs pkgs; module = self.nixosModules.default; };
         vm = pkgs.testers.runNixOSTest (import ./tests/vm.nix { module = self.nixosModules.default; });
       });
 

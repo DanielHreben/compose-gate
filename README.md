@@ -99,7 +99,11 @@ It needs `virtualisation.docker.enable`.
   and both halves against a fake `sudo` and `docker` (argv, environment,
   refusals and the lock). The package build runs these and flake8, so
   every host that builds compose-gate runs them.
+- `tests/module.nix` evaluates a NixOS system using the module and checks
+  the generated account, `sshd_config` block, sudo rule and `config.json`.
+  It needs no VM.
 - `nix flake check` also runs `tests/vm.nix`, a NixOS VM test with real
-  sshd, sudo and docker. It checks the account, the allowed commands,
+  sshd, sudo and docker. It needs KVM: under software emulation, Docker
+  inside the VM is too slow to start. It checks the account, the allowed commands,
   refusals that run nothing, no pty, forwarding, sftp or scp, and the key
   being refused from another address. CI runs it on every push.
