@@ -1,0 +1,108 @@
+# End to end: real sshd, sudo and docker. `client` holds the key and is the
+# only allowed source; `stranger` has the same key and must be refused.
+{ module }:
+{ pkgs, lib, ... }:
+let
+  keys = pkgs.runCommand "compose-gate-test-keys" { nativeBuildInputs = [ pkgs.openssh ]; } ''
+    mkdir $out
+    ssh-keygen -q -t ed25519 -N "" -C test -f $out/key
+  '';
+  image = pkgs.dockerTools.buildImage {
+    name = "gate-test";
+    tag = "latest";
+    copyToRoot = [ pkgs.busybox ];
+    config.Cmd = [ "/bin/sh" "-c" "while true; do echo tick; sleep 1; done" ];
+  };
+  client = { pkgs, ... }: {
+    environment.systemPackages = [ pkgs.openssh ];
+  };
+in
+{
+  name = "compose-gate";
+
+  nodes = {
+    inherit client;
+    stranger = client;
+    server = { nodes, ... }: {
+      imports = [ module ];
+      virtualisation.docker.enable = true;
+      virtualisation.memorySize = 2048;
+      services.openssh.enable = true;
+      environment.etc."app/docker-compose.yml".text = ''
+        services:
+          web:
+            image: gate-test:latest
+            pull_policy: never
+          sidecar:
+            image: gate-test:latest
+            pull_policy: never
+      '';
+      services.compose-gate = {
+        enable = true;
+        users.alice = {
+          project = "app";
+          directory = "/etc/app";
+          authorizedKeys = [ (lib.fileContents "${keys}/key.pub") ];
+          from = [ nodes.client.networking.primaryIPAddress ];
+        };
+      };
+    };
+  };
+
+  testScript = ''
+    start_all()
+    server.wait_for_unit("docker.service")
+    server.wait_for_unit("sshd.service")
+    server.succeed("docker load < ${image}")
+    server.succeed("docker compose -p app --project-directory /etc/app -f /etc/app/docker-compose.yml up -d")
+
+    for m in (client, stranger):
+        m.succeed("install -m 600 ${keys}/key /root/key")
+    ssh = "ssh -i /root/key -o StrictHostKeyChecking=no -o BatchMode=yes alice@server"
+
+    def gate(command):
+        return client.succeed(f"{ssh} {command} 2>&1")
+
+    def refused(command):
+        status, out = client.execute(f"{ssh} {command} 2>&1")
+        assert status != 0, f"{command!r} was accepted: {out}"
+        return out
+
+    with subtest("the account"):
+        server.succeed("getent passwd alice | grep -q ':/var/empty:/run/current-system/sw/bin/compose-gate$'")
+        server.fail("id -nG alice | grep -qw docker")
+        out = server.succeed("sudo -l -U alice")
+        assert "NOPASSWD: /run/current-system/sw/bin/compose-gate" in out, out
+        server.fail("sudo -u alice sudo -n /bin/sh -c id")
+
+    with subtest("allowed commands"):
+        assert "app-web-1" in gate("ps"), "ps"
+        client.wait_until_succeeds(f"{ssh} logs --tail 3 web 2>&1 | grep -q tick")
+        gate("restart sidecar")
+        gate("up --detach --wait")
+        out = gate("pull --quiet")
+        assert "refused" not in out, out
+        assert "Options only in this order" in gate("help")
+
+    with subtest("refused commands run nothing"):
+        for command in ["id", "'logs; id'", "'ps && touch /tmp/pwned'",
+                        "exec web sh", "run web sh", "-- -f /etc/passwd ps",
+                        "logs --tail=5", "'logs --tail 5 --follow'",
+                        "logs portainer", "'cp web:/bin/sh /tmp/pwned'"]:
+            assert "refused" in refused(command), command
+        server.fail("test -e /tmp/pwned")
+        server.succeed("journalctl -t compose-gate | grep -q refused")
+
+    with subtest("no pty, forwarding, sftp or scp"):
+        client.succeed(f"{ssh} -tt ps 2>&1 | grep -q 'app-web-1'")  # pty refused, command still forced
+        client.fail(f"{ssh} -o ExitOnForwardFailure=yes -L 9999:localhost:22 ps")
+        client.fail(f"{ssh} -o ExitOnForwardFailure=yes -R 9999:localhost:22 ps")
+        client.fail("sftp -i /root/key -o StrictHostKeyChecking=no -b /dev/null alice@server")
+        client.fail("scp -O -i /root/key -o StrictHostKeyChecking=no /etc/hosts alice@server:/tmp/pwned")
+        server.fail("test -e /tmp/pwned")
+
+    with subtest("the key works only from the allowed address"):
+        stranger.succeed("install -m 600 ${keys}/key /root/key")
+        stranger.fail(f"{ssh} ps")
+  '';
+}
