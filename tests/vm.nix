@@ -109,7 +109,9 @@ in
         for line in ["permittty no", "disableforwarding yes", "permituserrc no",
                      "permittunnel no", "authenticationmethods publickey",
                      "forcecommand /run/current-system/sw/bin/compose-gate"]:
-            assert line in effective.splitlines(), f"sshd -T lacks {line!r}"
+            # OpenSSH 10 prints names in CamelCase (PermitTTY), older ones in
+            # lower case.
+            assert line in effective.lower().splitlines(), f"sshd -T lacks {line!r}"
         # A local forward is refused only when something connects through it:
         # open it, then expect no SSH banner from zen's own port 22 through it.
         client.succeed(f"{ssh} -f -N -L 9999:localhost:22")
