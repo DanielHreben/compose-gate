@@ -43,7 +43,11 @@ in
           project = "app";
           directory = "/etc/app";
           authorizedKeys = [ (lib.fileContents "${keys}/key.pub") ];
-          from = [ nodes.client.networking.primaryIPAddress ];
+          # Both families: the test network resolves `server` to IPv6 first.
+          from = [
+            nodes.client.networking.primaryIPAddress
+            nodes.client.networking.primaryIPv6Address
+          ];
         };
       };
     };
@@ -80,8 +84,11 @@ in
         client.wait_until_succeeds(f"{ssh} logs --tail 3 web 2>&1 | grep -q tick")
         gate("restart sidecar")
         gate("up --detach --wait")
-        out = gate("pull --quiet")
+        # No network in the VM: what docker does with the pull doesn't
+        # matter here, only that the gate passed it on.
+        _, out = client.execute(f"{ssh} pull --quiet 2>&1")
         assert "refused" not in out, out
+        server.succeed("journalctl -t compose-gate | grep -q 'alice running pull --quiet'")
         assert "Options only in this order" in gate("help")
 
     with subtest("refused commands run nothing"):
@@ -95,7 +102,11 @@ in
 
     with subtest("no pty, forwarding, sftp or scp"):
         client.succeed(f"{ssh} -tt ps 2>&1 | grep -q 'app-web-1'")  # pty refused, command still forced
-        client.fail(f"{ssh} -o ExitOnForwardFailure=yes -L 9999:localhost:22 ps")
+        # A local forward is refused only when something connects through it:
+        # open it, then expect no SSH banner from zen's own port 22 through it.
+        client.succeed(f"{ssh} -f -N -L 9999:localhost:22")
+        client.fail("timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9999; head -c4 <&3' | grep -q SSH-")
+        client.succeed("pkill -f 'L 9999:localhost:22'")
         client.fail(f"{ssh} -o ExitOnForwardFailure=yes -R 9999:localhost:22 ps")
         client.fail("sftp -i /root/key -o StrictHostKeyChecking=no -b /dev/null alice@server")
         client.fail("scp -O -i /root/key -o StrictHostKeyChecking=no /etc/hosts alice@server:/tmp/pwned")
